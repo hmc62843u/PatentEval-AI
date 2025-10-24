@@ -1,9 +1,8 @@
-# patent_infringement_scanner.py
 import streamlit as st
 import json
 import requests
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 from bs4 import BeautifulSoup
 import urllib.parse
@@ -12,8 +11,6 @@ import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
 import groq
-from fpdf import FPDF
-import base64
 
 # Configure Groq client
 try:
@@ -24,6 +21,106 @@ except (KeyError, FileNotFoundError):
     st.error("❌ GROQ_API_KEY not found in Streamlit secrets. Please configure it in the Secrets tab.")
     st.stop()
 
+# Rate limiting functions (from reference)
+def init_usage_tracking():
+    """Initialize the usage tracking file if it doesn't exist"""
+    if not Path("patent_usage_tracker.json").exists():
+        with open("patent_usage_tracker.json", "w") as f:
+            json.dump({
+                "usage_count": 0, 
+                "last_reset": datetime.now().isoformat(), 
+                "usage_history": [],
+                "total_patents_generated": 0
+            }, f)
+
+def check_rate_limit():
+    """Check if the rate limit has been exceeded (max 3 uses per hour)"""
+    try:
+        with open("patent_usage_tracker.json", "r") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        init_usage_tracking()
+        return True, 0
+    
+    # Check if we need to reset the counter (new hour)
+    last_reset = datetime.fromisoformat(data["last_reset"])
+    now = datetime.now()
+    
+    if now - last_reset >= timedelta(hours=1):
+        # Reset the counter
+        data["usage_count"] = 0
+        data["last_reset"] = now.isoformat()
+        data["usage_history"] = []
+        
+        with open("patent_usage_tracker.json", "w") as f:
+            json.dump(data, f)
+    
+    # Check if limit exceeded
+    if data["usage_count"] >= 3:
+        return False, data["usage_count"]
+    
+    return True, data["usage_count"]
+
+def increment_usage(patent_title=""):
+    """Increment the usage counter"""
+    try:
+        with open("patent_usage_tracker.json", "r") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        init_usage_tracking()
+        with open("patent_usage_tracker.json", "r") as f:
+            data = json.load(f)
+    
+    # Check if we need to reset the counter (new hour)
+    last_reset = datetime.fromisoformat(data["last_reset"])
+    now = datetime.now()
+    
+    if now - last_reset >= timedelta(hours=1):
+        # Reset the counter
+        data["usage_count"] = 0
+        data["last_reset"] = now.isoformat()
+        data["usage_history"] = []
+    
+    # Increment usage
+    data["usage_count"] += 1
+    data["total_patents_generated"] = data.get("total_patents_generated", 0) + 1
+    data["usage_history"].append({
+        "timestamp": now.isoformat(),
+        "action": "infringement_analysis",
+        "patent_title": patent_title
+    })
+    
+    with open("patent_usage_tracker.json", "w") as f:
+        json.dump(data, f)
+    
+    return data["usage_count"], data["total_patents_generated"]
+
+def render_rate_limit_message(current_usage, is_allowed):
+    """Render rate limit information"""
+    if not is_allowed:
+        st.error("""
+        ❌ **Rate Limit Exceeded!**
+        
+        This demo allows **3 infringement analyses per hour** across all users.
+        
+        Please try again in the next hour or contact for full access.
+        """)
+        
+        try:
+            with open("patent_usage_tracker.json", "r") as f:
+                data = json.load(f)
+            last_reset_time = datetime.fromisoformat(data["last_reset"])
+            next_reset_time = last_reset_time + timedelta(hours=1)
+            st.info(f"⏰ **Next reset:** {next_reset_time.strftime('%H:%M:%S')}")
+        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+            st.info("⏰ **Next reset:** In 1 hour")
+        
+        return False
+    else:
+        if current_usage >= 2:  # Warning when approaching limit
+            st.warning(f"⚠️ **Usage Alert:** {current_usage}/3 analyses used this hour.")
+        return True
+    
 def render_disclaimer():
     """Render a prominent disclaimer banner"""
     st.markdown("""
@@ -309,9 +406,8 @@ def extract_text_from_file(uploaded_file):
         if uploaded_file.type == "text/plain":
             return uploaded_file.getvalue().decode("utf-8")
         elif uploaded_file.type == "application/pdf":
-            # Simple PDF text extraction - in production, use PyPDF2 or pdfplumber
+            # Simple PDF text extraction
             content = uploaded_file.getvalue()
-            # Extract text between parentheses and brackets as fallback
             text = re.sub(r'[^\x00-\x7F]+', ' ', content.decode('latin-1'))
             return text[:5000]  # Limit length
         else:
@@ -333,7 +429,6 @@ def combine_patent_documents(specification_text, claims_text, drawings_text):
     """
     return combined_text
 
-# Industry Detection Functions (from reference)
 def keyword_industry_detection(patent_text):
     """Tier 1: Fast keyword-based industry detection"""
     combined_text = patent_text.lower()
@@ -526,7 +621,6 @@ def robust_industry_detection(patent_text):
     
     return final_industries
 
-# Competitor Search and Infringement Analysis
 def scrape_website_content(url):
     """Scrape and extract meaningful content from a website"""
     try:
@@ -708,7 +802,7 @@ def infringement_risk_analysis(patent_claims, competitor_url):
         Be thorough and evidence-based in your assessment.
         """
         
-        response = groq_generate_content(analysis_prompt)
+        response = groq_generate_content(prompt)
         
         # Parse the JSON response
         try:
@@ -811,6 +905,102 @@ def industry_wide_infringement_scan(patent_text, patent_claims, max_competitors=
         "overall_risk_level": "High" if high_risk_count > 0 else "Medium" if len(competitors) > 0 else "Low"
     }
 
+def create_markdown_report(infringement_results, patent_claims):
+    """Create a comprehensive markdown report"""
+    report = f"""# Patent Infringement Analysis Report
+
+**Generated on:** {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+## ⚠️ Important Disclaimer
+
+This report provides automated analysis for informational purposes only and does not constitute legal advice. 
+Results are generated by AI and should be verified by qualified patent attorneys. 
+Infringement determinations require legal expertise and detailed technical analysis.
+
+## Executive Summary
+
+- **Competitors Scanned:** {infringement_results['scanned_competitors']}
+- **High Risk Findings:** {infringement_results['high_risk_findings']}
+- **Overall Risk Level:** {infringement_results['overall_risk_level']}
+- **Primary Industry:** {infringement_results.get('primary_industry', 'N/A')}
+
+## Industry Analysis
+
+"""
+    
+    # Add industry analysis
+    for industry, confidence in infringement_results.get('detected_industries', {}).items():
+        report += f"- **{industry}**: {confidence}% confidence\n"
+    
+    report += "\n## Patent Claims Overview\n\n"
+    report += f"```\n{patent_claims[:1000]}{'...' if len(patent_claims) > 1000 else ''}\n```\n\n"
+    
+    report += "## Detailed Competitor Analysis\n\n"
+    
+    # Add competitor analysis
+    for i, result in enumerate(infringement_results['detailed_results'], 1):
+        competitor = result['competitor_info']
+        analysis = result['risk_analysis']
+        
+        risk_emoji = {
+            "High": "🔴",
+            "Medium": "🟡",
+            "Low": "🟢",
+            "Error": "⚫"
+        }.get(analysis.get('risk_level', 'Unknown'), '⚫')
+        
+        report += f"### {i}. {competitor['name']} {risk_emoji}\n\n"
+        report += f"- **Website:** {competitor['url']}\n"
+        report += f"- **Risk Level:** {analysis.get('risk_level', 'Unknown')}\n"
+        report += f"- **Infringement Confidence:** {analysis.get('infringement_confidence', 'N/A')}\n\n"
+        
+        if analysis.get('key_findings'):
+            report += "#### Key Findings\n\n"
+            report += f"{analysis['key_findings']}\n\n"
+        
+        if analysis.get('overlapping_features'):
+            report += "#### Overlapping Features\n\n"
+            for feature in analysis['overlapping_features']:
+                report += f"- {feature}\n"
+            report += "\n"
+        
+        if analysis.get('recommendations'):
+            report += "#### Recommendations\n\n"
+            for rec in analysis['recommendations']:
+                report += f"- {rec}\n"
+            report += "\n"
+        
+        report += "---\n\n"
+    
+    # Add methodology and limitations
+    report += """## Methodology & Limitations
+
+### Analysis Methodology
+1. **Industry Detection**: Multi-tier analysis combining keyword matching, semantic similarity, and AI classification
+2. **Competitor Discovery**: AI-generated search queries based on patent content with real-time web search
+3. **Infringement Analysis**: Automated website content scraping and AI-powered feature matching
+4. **Risk Assessment**: Structured risk categorization (High/Medium/Low) with confidence levels
+
+### Important Limitations
+- This is an automated analysis and should be reviewed by qualified legal professionals
+- Website scraping may not capture all relevant product information
+- Analysis is based on publicly available information only
+- Does not include detailed claim construction or legal interpretation
+- Cannot account for patent validity or enforceability issues
+- Results are indicative and require legal verification
+
+## Next Steps
+
+1. **High Risk Findings**: Conduct detailed technical analysis and consider legal consultation
+2. **Medium Risk Findings**: Continue monitoring and document evidence
+3. **All Findings**: Regularly update analysis as competitors evolve
+4. **Legal Review**: Consult with qualified patent attorneys for formal opinion
+
+---
+*Report generated by Patent Infringement Scanner - For informational purposes only*"""
+    
+    return report
+
 def display_infringement_results(infringement_results, patent_claims):
     """Display infringement analysis results in Streamlit"""
     st.subheader("⚖️ Infringement Risk Analysis Results")
@@ -882,52 +1072,19 @@ def display_infringement_results(infringement_results, patent_claims):
             # Visit competitor button
             st.markdown(f"[🌐 Visit Competitor Website]({competitor['url']})")
     
-    # Generate and display PDF download button
+    # Generate and display Markdown download button
     st.markdown("---")
     st.markdown("### 📥 Download Report")
     
-    # Disclaimer for PDF download
-    st.caption("⚠️ The downloaded PDF report includes a prominent disclaimer. Share responsibly.")
+    # Create markdown report
+    markdown_report = create_markdown_report(infringement_results, patent_claims)
     
-    if st.button("Generate PDF Report"):
-        with st.spinner("🔄 Generating PDF report..."):
-            try:
-                pdf = create_pdf_report(infringement_results, patent_claims)
-                filename = f"patent_infringement_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-                
-                # Create download link
-                pdf_output = pdf.output(dest='S').encode('latin-1')
-                b64 = base64.b64encode(pdf_output).decode()
-                
-                href = f'<a href="data:application/pdf;base64,{b64}" download="{filename}" style="background-color: #4CAF50; color: white; padding: 14px 20px; text-align: center; text-decoration: none; display: inline-block; border-radius: 5px; font-size: 16px;">📥 Download PDF Report</a>'
-                st.markdown(href, unsafe_allow_html=True)
-                
-                st.success("✅ PDF report generated successfully!")
-                st.info("📋 Remember: This report is for informational purposes and requires legal review.")
-                
-            except Exception as e:
-                st.error(f"❌ Error generating PDF: {str(e)}")
-                # Fallback to JSON
-                st.info("🔄 Falling back to JSON format...")
-                json_data = json.dumps({
-                    "patent_claims": patent_claims,
-                    "analysis_summary": {
-                        "scanned_competitors": infringement_results['scanned_competitors'],
-                        "high_risk_findings": infringement_results['high_risk_findings'],
-                        "overall_risk_level": infringement_results['overall_risk_level'],
-                        "detected_industries": infringement_results.get('detected_industries', {})
-                    },
-                    "detailed_results": infringement_results['detailed_results'],
-                    "generated_at": datetime.now().isoformat(),
-                    "disclaimer": "This analysis is automated and does not constitute legal advice. Consult qualified patent attorneys for legal determinations."
-                }, indent=2)
-                
-                st.download_button(
-                    label="📥 Download JSON Report (Fallback)",
-                    data=json_data,
-                    file_name=f"patent_infringement_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                    mime="application/json"
-                )
+    st.download_button(
+        label="📥 Download Markdown Report",
+        data=markdown_report,
+        file_name=f"patent_infringement_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
+        mime="text/markdown"
+    )
 
 def main():
     st.set_page_config(
@@ -936,29 +1093,52 @@ def main():
         layout="wide"
     )
     
+    # Initialize usage tracking
+    init_usage_tracking()
+    
     st.title("⚖️ Patent Infringement Scanner")
-
+    
     # Render disclaimer at the top
     render_disclaimer()
-
+    
+    # Display usage information
+    is_allowed, current_usage = check_rate_limit()
+    
+    # Sidebar content with usage info
+    with st.sidebar:
+        st.title("📊 Usage Dashboard")
+        
+        try:
+            with open("patent_usage_tracker.json", "r") as f:
+                data = json.load(f)
+            total_analyses = data.get("total_patents_generated", 0)
+        except:
+            total_analyses = 0
+            
+        st.metric("Analyses This Hour", f"{current_usage}/3")
+        st.metric("Total Analyses", total_analyses)
+        
+        if not is_allowed:
+            st.error("❌ Limit Exceeded")
+        elif current_usage >= 2:
+            st.warning("⚠️ Approaching Limit")
+        else:
+            st.success("✅ Within Limit")
+        
+        # Add disclaimer to sidebar
+        st.markdown("---")
+        st.markdown("### ⚠️ Disclaimer")
+        st.sidebar.warning("""
+        This tool provides automated analysis only. 
+        Always consult with qualified patent attorneys 
+        for legal advice and infringement determinations.
+        """)
+    
     st.markdown("""
     Upload your patent documents to scan for potential infringement risks across the industry.
     This tool uses AI to detect relevant industries and analyze competitor websites for potential patent violations.
     """)
     
-    # Add requirement for fpdf
-    st.sidebar.markdown("### 📋 Requirements")
-    st.sidebar.info("This app requires the `fpdf` package for PDF generation. Install with: `pip install fpdf`")
-    
-    # Add disclaimer to sidebar as well
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### ⚠️ Disclaimer")
-    st.sidebar.warning("""
-    This tool provides automated analysis only. 
-    Always consult with qualified patent attorneys 
-    for legal advice and infringement determinations.
-    """)
-
     # File upload section
     st.markdown("## 📄 Upload Patent Documents")
     
@@ -1015,16 +1195,24 @@ def main():
             help="Depth of infringement analysis"
         )
     
-    # Start analysis button
+    # Start analysis button with rate limiting check
     analyze_button = st.button(
         "🔬 Start Infringement Analysis",
         type="primary",
-        disabled=not (specification_file and claims_file)
+        disabled=not (specification_file and claims_file and is_allowed)
     )
+    
+    if not is_allowed:
+        render_rate_limit_message(current_usage, is_allowed)
     
     if analyze_button:
         if not (specification_file and claims_file):
             st.error("Please upload both Specification and Claims documents to proceed.")
+            return
+        
+        # Check rate limit again before processing
+        is_allowed, current_usage = check_rate_limit()
+        if not render_rate_limit_message(current_usage, is_allowed):
             return
         
         # Extract text from files
@@ -1054,6 +1242,14 @@ def main():
             max_competitors
         )
         
+        # Increment usage counter after successful analysis
+        patent_title = f"Infringement Analysis - {specification_file.name}"
+        new_usage_count, total_analyses = increment_usage(patent_title)
+        
+        # Update sidebar metrics
+        st.sidebar.metric("Analyses This Hour", f"{new_usage_count}/3")
+        st.sidebar.metric("Total Analyses", total_analyses)
+        
         # Display results
         display_infringement_results(infringement_results, claims_text)
     
@@ -1074,7 +1270,8 @@ def main():
     - **Smart Competitor Discovery**: AI-generated search queries for relevant companies
     - **Comprehensive Risk Analysis**: Detailed infringement risk assessment
     - **Actionable Insights**: Specific recommendations for each finding
-    - **Professional PDF Reports**: Download comprehensive analysis in PDF format
+    - **Markdown Reports**: Download comprehensive analysis in markdown format
+    - **Usage Limits**: 3 analyses per hour to ensure service quality
     """)
 
 if __name__ == '__main__':
